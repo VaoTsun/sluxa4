@@ -1,0 +1,1001 @@
+# -*- coding: utf-8 -*-
+"""
+Голосовой ассистент:
+  - запуск приложений по команде после слова "подружка";
+  - "подружка"         — сразу включить голосовой ввод и печатать в
+    командную строку (терминал, где запущен OpenCode, заголовок "OC | ...");
+  - "подружка <текст>" — включить ввод и сразу напечатать <текст>;
+  - "подружка навык <имя>" — выполнить навык (напр. "навык отопление") и озвучить;
+  - "подружка дипсик"  — поднять/открыть окно DeepSeek;
+  - режим диктовки: распознанная речь печатается в активное окно;
+  - чтение ответа DeepSeek: снимок окна + OCR Windows + озвучка (голос Irina).
+"""
+import os
+import json
+import queue
+import re
+import time
+import base64
+import ctypes
+import subprocess
+import threading
+import winsound
+from ctypes import wintypes
+
+import sounddevice as sd
+from vosk import Model, KaldiRecognizer
+
+# ---------- Настройки ----------
+WAKE_WORD = "подружка"
+MODEL_PATH = "vosk-model-ru-0.42"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OCR_SCRIPT = os.path.join(BASE_DIR, "read_deepseek_window.ps1")
+TMP_DIR = os.environ.get("TEMP", BASE_DIR)
+CREATE_NO_WINDOW = 0x08000000
+
+# Пока существует этот файл — идёт озвучка (TTS): ассистент не слушает и не
+# распознаёт, чтобы не слышать сам себя и не печатать озвученный ответ в окно.
+# Создаётся как внутри speak(), так и при внешней озвучке (этот агент).
+SPEAK_LOCK = os.path.join(BASE_DIR, "speaking.lock")
+
+# ---------- Прогресс загрузки для пользователя ----------
+STATUS_TXT = os.path.join(BASE_DIR, "status.txt")
+STATUS_WINDOW = os.path.join(BASE_DIR, "status_window.ps1")
+
+
+def write_status(msg, done=False):
+    """Пишет этап загрузки в status.txt (для окна прогресса).
+    Формат: первая строка DONE/BUSY, дальше сообщение."""
+    try:
+        with open(STATUS_TXT, "w", encoding="utf-8") as _f:
+            _f.write("DONE\n" if done else "BUSY\n")
+            _f.write(str(msg) + "\n")
+    except Exception:
+        pass
+
+
+def start_status_window():
+    """Открывает окно прогресса загрузки (если скрипт есть)."""
+    if not os.path.exists(STATUS_WINDOW):
+        return
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden",
+             "-ExecutionPolicy", "Bypass", "-File", STATUS_WINDOW],
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+DEEPSEEK = "D:\\DeepSeek\\DeepSeek Harness.exe"
+
+# Обычные программы
+COMMANDS = {
+    "открой браузер": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "открой блокнот": "notepad.exe",
+    "открой телеграм": os.path.expanduser("~") + "\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe",
+    "включи музыку": "https://yandex.ru",
+}
+
+# "подружка дипсик" — открыть (или поднять) окно DeepSeek
+DEEPSEEK_WORDS = {
+    "дипсик", "дип сик", "дипсик апликэйшен",
+    "открой дипсик", "открой дип сик",
+    "открой дипсик приложение", "открой дипсик апликэйшен",
+}
+
+# "подружка слушай" — открыть (если закрыт) окно OpenCode и включить голосовой ввод
+OPENCODE_WORDS = {
+    "слушай", "слуушай", "слууушай", "слуууушай", "слууууушай",
+    "слушай слушай", "слушайте",
+}
+
+# Подстроки в заголовке окна (в порядке приоритета)
+DEEPSEEK_WINDOW = ["deepseek"]
+# OpenCode работает в командной строке (терминал) — заголовок "OC | ..."
+OPENCODE_WINDOW = ["oc |"]
+# Процессы терминалов (запасной поиск)
+TERMINAL_PROCS = ("windowsterminal.exe", "conhost.exe", "mintty.exe",
+                  "powershell.exe", "pwsh.exe", "cmd.exe")
+
+# Отдельная команда: открыть DeepSeek и сразу включить диктовку
+DIALOG_WORDS = {"диалог", "поговорим", "давай поговорим"}
+
+DICTATION_ON = {"печатай", "печать", "диктовка", "диктуй", "пиши", "набирай"}
+DICTATION_OFF = {"стоп", "хватит", "остановись", "закончили", "отмена", "не слушай"}
+SEND_WORDS = {"отправь", "отправить", "энтер", "enter"}
+READ_WORDS = {"читай", "прочитай", "прочти", "озвучь"}
+
+# Автоотправка в диктовке: после стольки секунд тишины нажать Enter
+AUTO_SEND_SECONDS = 3
+
+# Побудку слушаем ТОЛЬКО когда активно окно, в которое печатаем
+# (терминал OpenCode или DeepSeek). Если активно любое другое окно
+# (кино, игра, браузер) — полная тишина. Отключить: REQUIRE_TARGET_FOCUS = False
+REQUIRE_TARGET_FOCUS = True
+
+# "подружка навык <имя> ..." — выполнить навык (локальный скрипт) и озвучить
+SKILL_WORDS = {"навык", "навыки", "скилл", "skill"}
+SKILLS_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode", "skills")
+HEATING_SCRIPT = os.path.join(SKILLS_DIR, "heating-check", "scripts", "heating.ps1")
+PLAN_SCRIPT = os.path.join(SKILLS_DIR, "plan-day", "scripts", "plan.ps1")
+WEATHER_SCRIPT = os.path.join(SKILLS_DIR, "weather", "scripts", "weather.ps1")
+
+# навык-слово (как скажет пользователь) -> алиас -Preset у heating.ps1
+HEATING_PRESETS = {
+    "отопление": "отопление", "отопления": "отопление", "теплоноситель": "отопление",
+    "котельная": "котельная", "котельной": "котельная",
+    "прихожая": "прихожая", "прихожей": "прихожая",
+    "кухня": "кухня", "кухне": "кухня", "кухни": "кухня",
+    "ванная": "ванная", "ванной": "ванная",
+    "бойлер": "бойлер", "бойлера": "бойлер",
+    "колодец": "колодец", "колодца": "колодец",
+    "вольтметр": "вольтметр", "напряжение": "вольтметр",
+    "большой вольтметр": "большой вольтметр",
+}
+
+# числительные словами (для "за последние пять минут")
+RU_NUMBERS = {
+    "один": 1, "одну": 1, "одна": 1, "два": 2, "две": 2, "три": 3,
+    "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8,
+    "девять": 9, "десять": 10, "пятнадцать": 15, "двадцать": 20,
+    "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60,
+    "полчаса": 30, "час": 60,
+}
+
+NOISE_RE = re.compile(
+    r"(new session|^plugins$|workspaces|standard mode|background job|to-?dos|"
+    r"deep diving|message or|commands, files or sessions|searched code|"
+    r"ran commands|read files|running commands|in progress|pending|"
+    r"\bturns\b|\bsteps\b|tokens|bonus credit|valid until|"
+    r"agent sessions|chat|trajectory|application|workspace)",
+    re.IGNORECASE,
+)
+
+# ---------- Состояние ----------
+q = queue.Queue()
+rec = None
+mode = "idle"          # idle | dictation
+seen_lines = set()     # уже озвученные строки OCR
+paused = False         # ручная пауза (хоткей Ctrl+Alt+M)
+
+# Горячая клавиша паузы: Ctrl+Alt+M
+HOTKEY_ID = 0xB0B
+VK_M = 0x4D
+
+
+# ---------- Озвучка (SAPI, голос Irina ru-RU, скорость x1,5 = Rate 5) ----------
+def speak(text):
+    text = (text or "").strip()
+    if not text:
+        return
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    ps = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$s.Rate = 5; "  # скорость: 0 = обычная, 5 ≈ в 1,5 раза быстрее
+        "try { $s.SelectVoice('Microsoft Irina Desktop') } catch {}; "
+        "$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')); "
+        "$s.Speak($t)"
+    )
+    print("[Голос]", text)
+    try:
+        with open(SPEAK_LOCK, "w") as _f:
+            _f.write("speaking")
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps],
+            creationflags=CREATE_NO_WINDOW,
+            timeout=900,
+        )
+    except Exception as e:
+        print("[Ошибка озвучки]", e)
+    finally:
+        try:
+            os.remove(SPEAK_LOCK)
+        except OSError:
+            pass
+    time.sleep(0.3)
+    drain_mic()
+
+
+def drain_mic():
+    """Сбросить накопленный звук, чтобы ассистент не слышал сам себя."""
+    while not q.empty():
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+    try:
+        if rec is not None:
+            rec.Reset()
+    except Exception:
+        pass
+
+
+# ---------- Ввод текста в активное окно (SendInput Unicode) ----------
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+VK_RETURN = 0x0D
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTunion)]
+
+
+def _send_events(events):
+    n = len(events)
+    arr = (INPUT * n)()
+    for i, (vk, scan, flags) in enumerate(events):
+        arr[i].type = INPUT_KEYBOARD
+        arr[i].u.ki = KEYBDINPUT(vk, scan, flags, 0, None)
+    ctypes.windll.user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
+
+
+def type_text(text):
+    for ch in text:
+        cp = ord(ch)
+        _send_events([(0, cp, KEYEVENTF_UNICODE), (0, cp, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)])
+        time.sleep(0.003)
+
+
+def press_enter():
+    _send_events([(VK_RETURN, 0, 0), (VK_RETURN, 0, KEYEVENTF_KEYUP)])
+
+
+# ---------- OCR окна DeepSeek ----------
+def ocr_window():
+    if not os.path.exists(OCR_SCRIPT):
+        print("[OCR] Не найден помощник:", OCR_SCRIPT)
+        return ""
+    out_txt = os.path.join(TMP_DIR, "ds_ocr.txt")
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", OCR_SCRIPT, "-OutTxt", out_txt,
+             "-CropLeft", "280", "-CropTop", "60", "-CropBottom", "90"],
+            creationflags=CREATE_NO_WINDOW, timeout=180,
+        )
+    except Exception as e:
+        print("[OCR] Ошибка запуска:", e)
+        return ""
+    try:
+        with open(out_txt, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _norm(line):
+    return re.sub(r"\s+", " ", line).strip().lower()
+
+
+def is_noise(line):
+    if len(line) < 3:
+        return True
+    if len(line) < 80 and NOISE_RE.search(line):
+        return True
+    return False
+
+
+def baseline():
+    """Запомнить текущий текст окна, чтобы озвучивать только новое."""
+    text = ocr_window()
+    n = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not is_noise(line):
+            seen_lines.add(_norm(line))
+            n += 1
+    print(f"[OCR] Базовая линия: {n} строк")
+
+
+def read_answer():
+    text = ocr_window()
+    if not text:
+        speak("Не удалось прочитать окно")
+        return
+    new = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or is_noise(line):
+            continue
+        k = _norm(line)
+        if k in seen_lines:
+            continue
+        seen_lines.add(k)
+        new.append(line)
+    if not new:
+        speak("Нового текста нет")
+        return
+    print(f"[OCR] Новых строк: {len(new)}")
+    speak(" ".join(new))
+
+
+# ---------- Запуск программ ----------
+def run_program(path):
+    try:
+        if path.startswith("http"):
+            os.system(f"start {path}")
+        else:
+            subprocess.Popen([path])
+        print(f"[Успех] Открываю: {path}")
+        return True
+    except Exception as e:
+        print(f"[Ошибка] Не удалось открыть: {e}")
+        return False
+
+
+# ---------- Управление окнами: найти / поднять / открыть ----------
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+VK_MENU = 0x12
+SW_RESTORE = 9
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _all_windows():
+    handles = []
+
+    def _cb(hwnd, lparam):
+        handles.append(hwnd)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return handles
+
+
+def window_process_name(hwnd):
+    """Имя exe-файла процесса, которому принадлежит окно."""
+    wpid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wpid.value)
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value)
+    finally:
+        kernel32.CloseHandle(h)
+    return ""
+
+
+def find_window(patterns, procs=None):
+    """Найти видимое окно, в заголовке которого есть одна из подстрок
+    (в порядке приоритета). procs — необязательный список имён процессов.
+    Возвращает (hwnd, title) или (None, None)."""
+    handles = _all_windows()
+    procs = [p.lower() for p in procs] if procs else None
+    for pat in patterns:
+        pat = pat.lower()
+        for hwnd in handles:
+            if not user32.IsWindowVisible(hwnd):
+                continue
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                continue
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            if pat not in title.lower():
+                continue
+            if procs and window_process_name(hwnd).lower() not in procs:
+                continue
+            return hwnd, title
+    return None, None
+
+
+def bring_to_foreground(hwnd):
+    """Развернуть окно и вывести на передний план (обход ограничения
+    SetForegroundWindow имитацией нажатия Alt)."""
+    try:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    except Exception:
+        pass
+    try:
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+    try:
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+
+
+def focus_or_open(patterns, exe_path, wait=5):
+    """Если окно найдено — поднять его; иначе запустить программу и подождать."""
+    hwnd, title = find_window(patterns)
+    if hwnd:
+        bring_to_foreground(hwnd)
+        print(f"[Фокус] Поднимаю окно: {title}")
+        time.sleep(0.5)
+        return True
+    print(f"[Запуск] Окно не найдено, открываю: {exe_path}")
+    run_program(exe_path)
+    time.sleep(wait)
+    hwnd, title = find_window(patterns)
+    if hwnd:
+        bring_to_foreground(hwnd)
+        time.sleep(0.5)
+    return False
+
+
+def find_window_by_proc(procs):
+    """Найти видимое окно, принадлежащее процессу из списка procs."""
+    pl = [p.lower() for p in procs]
+    for hwnd in _all_windows():
+        if not user32.IsWindowVisible(hwnd):
+            continue
+        if window_process_name(hwnd).lower() in pl:
+            length = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            return hwnd, buf.value
+    return None, None
+
+
+def focus_opencode():
+    """Поднять окно OpenCode, открытое в командной строке (терминал)."""
+    hwnd, title = find_window(OPENCODE_WINDOW)
+    if hwnd:
+        bring_to_foreground(hwnd)
+        print(f"[Фокус] Терминал OpenCode: {title}")
+        time.sleep(0.5)
+        return True
+    hwnd, title = find_window(["opencode"], procs=TERMINAL_PROCS)
+    if hwnd:
+        bring_to_foreground(hwnd)
+        print(f"[Фокус] Терминал: {title}")
+        time.sleep(0.5)
+        return True
+    hwnd, title = find_window_by_proc(("windowsterminal.exe",))
+    if hwnd:
+        bring_to_foreground(hwnd)
+        print(f"[Фокус] Windows Terminal: {title}")
+        time.sleep(0.5)
+        return True
+    print("[Фокус] Терминал OpenCode не найден")
+    return False
+
+
+# ---------- Пауза: полный экран и горячая клавиша ----------
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def foreground_title():
+    """Заголовок активного (переднего) окна."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def target_focused():
+    """Активно ли окно, в которое печатает ассистент (OpenCode / DeepSeek).
+    Если нет — ассистент молчит и ничего не ворует."""
+    t = foreground_title().lower()
+    if not t:
+        return False
+    for pat in OPENCODE_WINDOW + DEEPSEEK_WINDOW:
+        if pat in t:
+            return True
+    return "opencode" in t
+
+
+def is_fullscreen():
+    """True, если что-то идёт во весь экран (кино, игра, презентация)."""
+    # 1) Системный признак: полноэкранное приложение / режим презентации.
+    try:
+        QUNS_BUSY = 2
+        QUNS_RUNNING_D3D_FULL_SCREEN = 3
+        QUNS_PRESENTATION_MODE = 4
+        state = ctypes.c_int()
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+            if state.value in (QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+                               QUNS_PRESENTATION_MODE):
+                return True
+    except Exception:
+        pass
+    # 2) Запасной путь: переднее окно занимает весь монитор.
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        # Развёрнутое (maximized) окно — это НЕ полный экран (иначе, при
+        # скрытом меню «Пуск», любой максимизированный терминал ложно сработал).
+        GWL_STYLE = -16
+        WS_MAXIMIZE = 0x01000000
+        if user32.GetWindowLongW(hwnd, GWL_STYLE) & WS_MAXIMIZE:
+            return False
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        MONITOR_DEFAULTTONEAREST = 2
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return False
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+        m = mi.rcMonitor
+        return (rect.left <= m.left and rect.top <= m.top
+                and rect.right >= m.right and rect.bottom >= m.bottom)
+    except Exception:
+        return False
+
+
+def hotkey_thread():
+    """Слушать Ctrl+Alt+M в фоне и переключать ручную паузу."""
+    global paused
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    WM_HOTKEY = 0x0312
+    if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_M):
+        print("[Хоткей] Не удалось занять Ctrl+Alt+M (уже используется)")
+        return
+    print("[Хоткей] Ctrl+Alt+M — пауза / слушать")
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+            paused = not paused
+            print("[Хоткей] ПАУЗА — не слушаю" if paused else "[Хоткей] СЛУШАЮ")
+            try:
+                winsound.Beep(1200 if paused else 800, 150)
+            except Exception:
+                pass
+
+
+def split_lead(text, words):
+    """Если text начинается с одного из слов-команд (отдельным словом),
+    вернуть (найденное_слово, остаток). Иначе (None, text)."""
+    low = text.lower()
+    for w in sorted(words, key=len, reverse=True):
+        if low == w:
+            return w, ""
+        if low.startswith(w + " "):
+            return w, text[len(w):].strip()
+    return None, text
+
+
+# ---------- Навыки (запуск локальных скриптов) ----------
+def parse_minutes(text, default=5):
+    """Достать число минут: цифрами ('5 минут') или словами ('пять минут')."""
+    m = re.search(r"\d+", text)
+    if m:
+        try:
+            return int(m.group())
+        except ValueError:
+            pass
+    for w in re.findall(r"[а-яё]+", text.lower()):
+        if w in RU_NUMBERS:
+            return RU_NUMBERS[w]
+    return default
+
+
+def _run_skill_script(script, args):
+    """Запустить скрипт навыка и вернуть его stdout (UTF-8)."""
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", script] + args,
+            creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=180,
+        )
+    except Exception as e:
+        print("[Навык] Ошибка запуска:", e)
+        return None
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    if not out:
+        out = proc.stderr.decode("utf-8", errors="replace").strip()
+    return out
+
+
+def run_heating_skill(preset, minutes):
+    """Навык heating-check: запустить heating.ps1 и озвучить итог."""
+    if not os.path.exists(HEATING_SCRIPT):
+        speak("Не найден скрипт навыка проверки.")
+        return
+    out = _run_skill_script(HEATING_SCRIPT, ["-Preset", preset, "-Minutes", str(minutes)])
+    if not out:
+        speak("Навык не вернул данных.")
+        return
+    print("[Навык] heating:", out.replace("\n", " | ")[:400])
+
+    device = ""
+    mm = re.search(r"Устройство:\s*([^\n(]+)", out)
+    if mm:
+        device = mm.group(1).strip()
+    now = re.search(r"Сейчас:\s*([-\d.,]+)", out)
+    vmin = re.search(r"Мин:\s*([-\d.,]+)", out)
+    vmax = re.search(r"Макс:\s*([-\d.,]+)", out)
+    delta = re.search(r"Изменение:\s*([-\d.,]+)", out)
+    if not now:
+        speak(out.replace("\n", " "))
+        return
+
+    low = out.lower()
+    if "мощность" in low or "ватт" in low:
+        unit = "ватт"
+    elif "напряжение" in low:
+        unit = "вольт"
+    else:
+        unit = "градусов"
+
+    name = device or "Датчик"
+    parts = [f"{name}: сейчас {now.group(1)} {unit}"]
+    if vmin and vmax:
+        if vmin.group(1) != vmax.group(1):
+            parts.append(f"за последние {minutes} минут от {vmin.group(1)} до {vmax.group(1)}")
+        else:
+            parts.append(f"за последние {minutes} минут без изменений")
+    if delta:
+        try:
+            d = float(delta.group(1).replace(",", "."))
+            if abs(d) >= 0.1:
+                parts.append(f"изменение {'плюс' if d > 0 else 'минус'} {abs(d):g}")
+        except ValueError:
+            pass
+    speak(". ".join(parts))
+
+
+def run_plan_skill(text):
+    """'навык план ...' — добавить/отметить/показать задачи дня."""
+    low = (text or "").lower()
+    # добавить задачу
+    for w in ("план добавить", "план добавь задачу", "план добавь, добавь", "план добавь",
+              "план запиши", "план занеси", "план новая задача"):
+        if low.startswith(w):
+            rest = text[len(w):].strip()
+            if not rest:
+                speak("Что добавить в план? Например: навык план добавь купить хлеба.")
+                return
+            out = _run_skill_script(PLAN_SCRIPT, ["-Add", rest])
+            speak(out or "Добавлено в план.")
+            return
+    # отметить сделанным по номеру
+    m = re.search(r"план\s+(?:сде(?:лал|лано|лай)|выполнен\w*|отмет\w*)\s*(?:номер)?\s*(\d+)", low)
+    if m:
+        num = m.group(1)
+        out = _run_skill_script(PLAN_SCRIPT, ["-DoneN", num])
+        speak(out or "Задача " + num + " отмечена.")
+        return
+    # отметить сделанным по названию
+    for w in ("план сделал", "план сделано", "план сделай", "план выполнил",
+              "план выполнено", "план отметить", "план отметь"):
+        if low.startswith(w):
+            rest = text[len(w):].strip()
+            if not rest:
+                speak("Что именно отметить? Например: план сделал купить хлеба.")
+                return
+            out = _run_skill_script(PLAN_SCRIPT, ["-Done", rest])
+            speak(out or "Отмечено.")
+            return
+    # показать план
+    for w in ("план покажи", "план показать", "план список", "план прочитай",
+              "план читай", "план что делать", "план на сегодня"):
+        if low.startswith(w):
+            out = _run_skill_script(PLAN_SCRIPT, ["-List"])
+            speak(out or "План пуст.")
+            return
+    # очистить сделанное
+    for w in ("план очисти", "план убрать сделанное", "план почисти", "план удали сделанное"):
+        if low.startswith(w):
+            out = _run_skill_script(PLAN_SCRIPT, ["-Clear"])
+            speak(out or "Сделанные задачи убраны.")
+            return
+    # просто "план"
+    if low.startswith("план"):
+        out = _run_skill_script(PLAN_SCRIPT, ["-List"])
+        speak(out or "План пуст.")
+        return
+    speak("Команды плана: добавь дело, сделал дело или сделал номер N, покажи, очисти сделанное.")
+
+
+def run_weather_skill(text):
+    """'навык погода ...' — погода в Турмантасе (Gismeteo)."""
+    low = (text or "").lower()
+    args = []
+    if "10" in low or "десять" in low or "недел" in low or "дней" in low:
+        args = ["-Ten"]
+    elif "сейчас" in low:
+        args = ["-Now"]
+    out = _run_skill_script(WEATHER_SCRIPT, args)
+    speak(out or "Не удалось получить погоду.")
+
+
+def run_skill(text):
+    """'навык <имя> ...' — найти навык по имени и выполнить его."""
+    low = (text or "").lower().strip()
+    if not low:
+        speak("Какой навык выполнить? Например: навык отопление.")
+        return
+    if "план" in low.split():
+        run_plan_skill(text)
+        return
+    if "погода" in low.split() or "погоду" in low.split():
+        run_weather_skill(text)
+        return
+    minutes = parse_minutes(low, 5)
+    for key in sorted(HEATING_PRESETS, key=len, reverse=True):
+        if key in low:
+            run_heating_skill(HEATING_PRESETS[key], minutes)
+            return
+    print(f"[Навык] Неизвестный навык: '{low}'")
+    speak("Не знаю такой навык. Умею: погода, отопление, план, котельная, кухня, "
+          "ванная, прихожая, бойлер, колодец, вольтметр.")
+
+
+# ---------- Обработка команд ----------
+def handle_command(command):
+    global mode
+    command = command.strip()
+
+    # "подружка дипсик ..." — открыть/поднять окно DeepSeek
+    word, _rest = split_lead(command, DEEPSEEK_WORDS)
+    if word:
+        speak("Поняла")
+        focus_or_open(DEEPSEEK_WINDOW, DEEPSEEK, wait=5)
+        time.sleep(2)
+        baseline()
+        return
+
+    # "подружка слушай ..." — голосовой ввод в командную строку OpenCode
+    # (без голосового подтверждения — диктовка включается сразу)
+    word, rest = split_lead(command, OPENCODE_WORDS)
+    if word:
+        found = focus_opencode()
+        mode = "dictation"
+        if not found:
+            speak("Терминал OpenCode не найден. Печатаю в активное окно.")
+        else:
+            speak("Поняла")
+        if rest:
+            type_text(rest + " ")
+        return
+
+    # "подружка диалог ..." — DeepSeek + диктовка
+    word, rest = split_lead(command, DIALOG_WORDS)
+    if word:
+        focus_or_open(DEEPSEEK_WINDOW, DEEPSEEK, wait=5)
+        time.sleep(2)
+        baseline()
+        mode = "dictation"
+        speak("Поняла, говорите.")
+        if rest:
+            type_text(rest + " ")
+        return
+
+    # "печатай ..." — диктовка в текущее окно
+    word, rest = split_lead(command, DICTATION_ON)
+    if word:
+        mode = "dictation"
+        speak("Поняла, говорите.")
+        if rest:
+            type_text(rest + " ")
+        return
+
+    # "подружка навык <имя> ..." — выполнить навык и озвучить результат
+    word, rest = split_lead(command, SKILL_WORDS)
+    if word:
+        speak("Думаю")
+        run_skill(rest)
+        return
+
+    if command in COMMANDS:
+        speak("Думаю")
+        run_program(COMMANDS[command])
+        return
+
+    if command in READ_WORDS:
+        read_answer()
+        return
+
+    if command in DICTATION_OFF:
+        mode = "idle"
+        speak("Стоп")
+        return
+
+    # Всё остальное — это диктовка:
+    #   "подружка"         → просто включить ввод;
+    #   "подружка <текст>" → включить ввод и сразу напечатать <текст>.
+    found = focus_opencode()
+    mode = "dictation"
+    if not found:
+        speak("Терминал OpenCode не найден. Печатаю в активное окно.")
+    else:
+        speak("Поняла")
+    if command:
+        type_text(command + " ")
+    return
+
+
+# ---------- Микрофон ----------
+def callback(indata, frames, time_info, status):
+    if status:
+        print(status)
+    q.put(bytes(indata))
+
+
+def main():
+    global rec, mode
+    if not os.path.exists(MODEL_PATH):
+        print(f"Нет модели по пути '{MODEL_PATH}'")
+        return
+
+    threading.Thread(target=hotkey_thread, daemon=True).start()
+
+    # Прогресс загрузки для пользователя: окно статуса + status.txt
+    start_status_window()
+    write_status("Загружаю модель распознавания… это 3–4 минуты")
+    print("[Загрузка] Модель Vosk… это 3–4 минуты, голос пока не слушаю")
+
+    model = Model(MODEL_PATH)
+    device_info = sd.query_devices(None, "input")
+    samplerate = int(device_info["default_samplerate"])
+
+    print("=" * 64)
+    print(f"Слушаю микрофон. Обращение: '{WAKE_WORD}'.")
+    print(f"         '{WAKE_WORD}'         — голосовой ввод в командную строку OpenCode")
+    print(f"         '{WAKE_WORD} <текст>' — ввод + сразу напечатать <текст>")
+    print(f"         '{WAKE_WORD} дипсик'  — открыть/поднять окно DeepSeek")
+    print(f"         '{WAKE_WORD} навык отопление' — выполнить навык и озвучить результат")
+    print(f"         '{WAKE_WORD} диалог'  — открыть DeepSeek и включить диктовку")
+    print(f"         '{WAKE_WORD} открой браузер' — запустить команду")
+    print(f"         (в диктовке: {AUTO_SEND_SECONDS} с тишины — авто-отправка; 'отправь' | 'читай' | 'стоп')")
+    print("         Слушаю только когда активно окно OpenCode (или DeepSeek).")
+    print("         Ctrl+Alt+M — пауза/слушать; в полном экране пауза сама.")
+    print("=" * 64)
+
+    try:
+        baseline()
+    except Exception:
+        pass
+
+    # Голос готов: обновляем окно статуса, бип + голосовое объявление
+    write_status("Готова — слушаю. Говорите: «подружка»", done=True)
+    try:
+        winsound.MessageBeep()
+    except Exception:
+        pass
+    speak("Подружка готова. Говорите.")
+
+    with sd.RawInputStream(
+        samplerate=samplerate, blocksize=8000, device=None,
+        dtype="int16", channels=1, callback=callback,
+    ):
+        rec = KaldiRecognizer(model, samplerate)
+        last_activity = time.time()
+        last_partial = ""
+        pending_send = False
+        was_blocked = False
+        # подчистить возможный "зависший" замок озвучки от прошлого запуска
+        try:
+            os.remove(SPEAK_LOCK)
+        except OSError:
+            pass
+        while True:
+            data = q.get()
+
+            # Пауза: вручную (хоткей), сама в полноэкранном видео, либо когда
+            # активно постороннее окно (кино/игра/браузер). Тогда не слушаем,
+            # не воруем фокус и не печатаем.
+            fs = is_fullscreen()
+            focused = target_focused() if REQUIRE_TARGET_FOCUS else True
+            speaking_now = os.path.exists(SPEAK_LOCK)
+            blocked = paused or fs or not focused or speaking_now
+            if blocked != was_blocked:
+                if blocked:
+                    if paused:
+                        why = "горячая клавиша"
+                    elif speaking_now:
+                        why = "идёт озвучка (не слушаю себя)"
+                    elif not focused:
+                        why = "окно не активно"
+                    else:
+                        why = "полный экран"
+                    print(f"[Пауза] {why} — не слушаю")
+                else:
+                    print("[Слушаю снова]")
+                was_blocked = blocked
+            if blocked:
+                if mode == "dictation":
+                    mode = "idle"
+                    pending_send = False
+                continue
+
+            # В диктовке следим за речью и автоотправкой по тишине
+            if mode == "dictation":
+                partial = json.loads(rec.PartialResult()).get("partial", "").strip()
+                if partial and partial != last_partial:
+                    last_partial = partial
+                    last_activity = time.time()
+                    pending_send = True
+                elif pending_send and (time.time() - last_activity) >= AUTO_SEND_SECONDS:
+                    press_enter()
+                    print(f"[Автоотправка] тишина {AUTO_SEND_SECONDS} с")
+                    pending_send = False
+                    last_partial = ""
+
+            if not rec.AcceptWaveform(data):
+                continue
+            result = json.loads(rec.Result())
+            text = result.get("text", "").strip()
+            if not text:
+                continue
+            print("Распознано:", text)
+
+            if mode == "dictation":
+                low = text.lower().strip()
+                if low in DICTATION_OFF:
+                    mode = "idle"
+                    pending_send = False
+                    speak("Диктовка выключена")
+                elif low in SEND_WORDS:
+                    press_enter()
+                    pending_send = False
+                    print("[Отправлено]")
+                elif low in READ_WORDS:
+                    read_answer()
+                else:
+                    type_text(text + " ")
+                    last_activity = time.time()
+                    last_partial = ""
+                    pending_send = True
+            else:
+                if text.startswith(WAKE_WORD):
+                    command = text[len(WAKE_WORD):].strip()
+                    handle_command(command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nВыход.")
+    finally:
+        write_status("Остановлена")

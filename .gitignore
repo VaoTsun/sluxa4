@@ -1,0 +1,24 @@
+# Vosk-модели (скачиваются/кладутся отдельно)
+vosk-model-*/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# Логи и рантайм-состояние
+*.log
+*.err
+*.lock
+status.txt
+
+# Сгенерированные/рантайм-данные
+prices/reports/
+prices/history.csv
+alerts/state.json
+prices/state.json
+assistant.log.before_pause_fix
+
+# Секреты
+.env
+service.json

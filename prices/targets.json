@@ -1,0 +1,53 @@
+{
+  "title": "Роботы-газонокосилки (любые модели, в т.ч. со снежным отвалом)",
+  "max_price": 2500,
+  "targets": [
+    {
+      "site": "Kelmestechnika",
+      "type": "jsonld",
+      "label": "GUST 550 со снежным отвалом",
+      "url": "https://www.kelmestechnika.lt/benzinine-zoliapjove-robotas-gust-550-55cm-loncin-196cc-su-sniego-peiliu"
+    },
+    {
+      "site": "Kelmestechnika",
+      "type": "jsonld",
+      "label": "GUST 550 (без отвала)",
+      "url": "https://www.kelmestechnika.lt/benzinine-zoliapjove-robotas-gust-550-55cm-loncin-196cc"
+    },
+    {
+      "site": "Martynotechnika",
+      "type": "opencart_category",
+      "label": "GTM роботы",
+      "filter": "Vejos priežiūros robotas",
+      "url": "https://martynotechnika.lt/sunkioji-technika/vejos-prieziuros-robotas/"
+    },
+    {
+      "site": "Kainos.lt",
+      "type": "kainos_search",
+      "label": "Поиск: GUST 550",
+      "url": "https://www.kainos.lt/paieska/gust-550-kaina",
+      "exclude_sellers": ["Kelmestechnika.lt"]
+    },
+    {
+      "site": "Kainos.lt",
+      "type": "kainos_search",
+      "label": "Поиск: роботы со снежным модулем",
+      "url": "https://www.kainos.lt/paieska/robotas-sniego-kaina",
+      "exclude_sellers": ["Kelmestechnika.lt"]
+    },
+    {
+      "site": "Skelbiu.lt",
+      "type": "skelbiu_search",
+      "label": "Б/у: роботы-косилки",
+      "url": "https://www.skelbiu.lt/paieska/zoliapjove-robotas/",
+      "filter": "(robot|žolia|zolia|mulčer|mulcer|vejos|snieg)"
+    },
+    {
+      "site": "Skelbiu.lt",
+      "type": "skelbiu_search",
+      "label": "Б/у: веjо-роботы",
+      "url": "https://www.skelbiu.lt/paieska/vejos-robotas/",
+      "filter": "(robot|žolia|zolia|mulčer|mulcer|vejos|snieg)"
+    }
+  ]
+}
