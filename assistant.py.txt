@@ -121,6 +121,7 @@ SKILLS_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode", "skill
 HEATING_SCRIPT = os.path.join(SKILLS_DIR, "heating-check", "scripts", "heating.ps1")
 PLAN_SCRIPT = os.path.join(SKILLS_DIR, "plan-day", "scripts", "plan.ps1")
 WEATHER_SCRIPT = os.path.join(SKILLS_DIR, "weather", "scripts", "weather.ps1")
+TELEGRAM_SCRIPT = os.path.join(SKILLS_DIR, "heating-telegram", "scripts", "heating-telegram.ps1")
 
 # навык-слово (как скажет пользователь) -> алиас -Preset у heating.ps1
 HEATING_PRESETS = {
@@ -683,6 +684,16 @@ def run_heating_skill(preset, minutes):
     speak(". ".join(parts))
 
 
+def run_heating_telegram_skill(preset, minutes):
+    """Навык heating-telegram: отправить сводку датчика в Telegram и озвучить итог."""
+    if not os.path.exists(TELEGRAM_SCRIPT):
+        speak("Не найден скрипт отправки в телеграм.")
+        return
+    out = _run_skill_script(TELEGRAM_SCRIPT, ["-Preset", preset, "-Minutes", str(minutes)])
+    print("[Навык] telegram:", (out or "").replace("\n", " | ")[:300])
+    speak(out or "Не удалось отправить сводку в телеграм.")
+
+
 def run_plan_skill(text):
     """'навык план ...' — добавить/отметить/показать задачи дня."""
     low = (text or "").lower()
@@ -760,14 +771,23 @@ def run_skill(text):
     if "погода" in low.split() or "погоду" in low.split():
         run_weather_skill(text)
         return
+    if "телеграм" in low or "телеграмм" in low or "telegram" in low:
+        minutes = parse_minutes(low, 5)
+        preset = "отопление"
+        for key in sorted(HEATING_PRESETS, key=len, reverse=True):
+            if key in low:
+                preset = HEATING_PRESETS[key]
+                break
+        run_heating_telegram_skill(preset, minutes)
+        return
     minutes = parse_minutes(low, 5)
     for key in sorted(HEATING_PRESETS, key=len, reverse=True):
         if key in low:
             run_heating_skill(HEATING_PRESETS[key], minutes)
             return
     print(f"[Навык] Неизвестный навык: '{low}'")
-    speak("Не знаю такой навык. Умею: погода, отопление, план, котельная, кухня, "
-          "ванная, прихожая, бойлер, колодец, вольтметр.")
+    speak("Не знаю такой навык. Умею: погода, отопление, отопление в телеграм, "
+          "план, котельная, кухня, ванная, прихожая, бойлер, колодец, вольтметр.")
 
 
 # ---------- Обработка команд ----------
